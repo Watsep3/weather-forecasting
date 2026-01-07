@@ -3,7 +3,7 @@ Azure ML - Weather Forecasting PIPELINE COMPLET
 Prédiction : Température (régression) + Précipitations (classification)
 Pipeline unifié avec modèles liés
 Compatible Azure ML - Sans imbalanced-learn
-VERSION FINALE - Pipeline intégré avec gestion d'erreurs + Azure ML
+VERSION FINALE - Pipeline intégré avec DÉTECTION OVERFITTING CORRIGÉE
 """
 
 import pandas as pd
@@ -244,11 +244,11 @@ class WeatherMLPipeline:
             'DecisionTree': DecisionTreeRegressor(max_depth=10, random_state=42)
         }
         
-        # Modèles de classification pour pluie
+        # Modèles de classification pour pluie - ORDRE IMPORTANT (simple → complexe)
         self.classification_models = {
+            'LogisticRegression': LogisticRegression(random_state=42, max_iter=1000),
             'RandomForest': RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10),
             'GradientBoosting': GradientBoostingClassifier(n_estimators=100, random_state=42, max_depth=5),
-            'LogisticRegression': LogisticRegression(random_state=42, max_iter=1000),
             'DecisionTree': DecisionTreeClassifier(max_depth=10, random_state=42)
         }
         
@@ -533,11 +533,14 @@ class WeatherMLPipeline:
         return results
     
     def train_rain_models(self, X_train, X_test, y_train, y_test):
-        """Entraîner et comparer les modèles de pluie"""
+        """
+        Entraîner et comparer les modèles de pluie
+        AVEC DÉTECTION D'OVERFITTING AMÉLIORÉE - Pénalise les scores parfaits
+        """
         results = {}
         
         print("\n" + "="*80)
-        print("🌧️  ENTRAÎNEMENT DES MODÈLES DE PLUIE")
+        print("🌧️  ENTRAÎNEMENT DES MODÈLES DE PLUIE (détection overfitting renforcée)")
         print("="*80)
         
         # Vérifier si on a au moins 2 classes
@@ -548,17 +551,37 @@ class WeatherMLPipeline:
             print(f"   Classes présentes: {np.unique(y_train)}")
             return results
         
+        # Déterminer le nombre de folds pour CV
+        min_class_count = min(Counter(y_train).values())
+        cv_folds = min(3, min_class_count)
+        
+        if cv_folds < 2:
+            print(f"\n⚠️ ATTENTION: Pas assez de données pour Cross-Validation fiable")
+            print(f"   Classe minoritaire: {min_class_count} échantillons")
+            print(f"   Un dataset plus large est fortement recommandé!")
+        
+        # 🔑 Détecter si le dataset est trop petit
+        dataset_too_small = len(X_train) < 100 or len(X_test) < 20
+        if dataset_too_small:
+            print(f"\n⚠️ DATASET TROP PETIT DÉTECTÉ:")
+            print(f"   Train: {len(X_train)} | Test: {len(X_test)}")
+            print(f"   → Pénalités automatiques pour scores parfaits activées")
+        
         for model_name, model in self.classification_models.items():
             print(f"\n📦 Entraînement: {model_name}")
             
+            # Entraînement
             model.fit(X_train, y_train)
             
+            # Prédictions
             y_pred_train = model.predict(X_train)
             y_pred_test = model.predict(X_test)
             
+            # Métriques sur train
             acc_train = accuracy_score(y_train, y_pred_train)
-            acc_test = accuracy_score(y_test, y_pred_test)
             
+            # Métriques sur test
+            acc_test = accuracy_score(y_test, y_pred_test)
             precision, recall, f1, _ = precision_recall_fscore_support(
                 y_test, y_pred_test, average='binary', zero_division=0
             )
@@ -568,18 +591,93 @@ class WeatherMLPipeline:
             if hasattr(model, 'predict_proba'):
                 try:
                     y_proba_all = model.predict_proba(X_test)
-                    # Vérifier si on a bien 2 colonnes
                     if y_proba_all.shape[1] == 2:
                         y_proba = y_proba_all[:, 1]
-                        # Vérifier qu'on a au moins 2 classes dans y_test
                         if len(np.unique(y_test)) > 1:
                             roc_auc = roc_auc_score(y_test, y_proba)
-                    else:
-                        print(f"    ⚠️ Une seule classe prédite, ROC AUC non calculable")
                 except Exception as e:
                     print(f"    ⚠️ Erreur calcul ROC AUC: {e}")
                     roc_auc = 0.0
             
+            # 🔑 CROSS-VALIDATION pour détecter l'overfitting
+            cv_f1_mean = 0.0
+            cv_f1_std = 0.0
+            overfitting_detected = False
+            final_score = f1  # Score par défaut
+            
+            if cv_folds >= 2 and len(X_train) >= 10:
+                try:
+                    print(f"  📊 Cross-Validation ({cv_folds}-fold)...")
+                    cv_scores = cross_val_score(
+                        model, X_train, y_train, 
+                        cv=cv_folds,
+                        scoring='f1'
+                    )
+                    cv_f1_mean = cv_scores.mean()
+                    cv_f1_std = cv_scores.std()
+                    
+                    print(f"     CV F1: {cv_f1_mean:.3f} (±{cv_f1_std:.3f})")
+                    
+                    # 🔴 NOUVELLE LOGIQUE DE DÉTECTION - Pénalise TOUJOURS les scores parfaits
+                    
+                    # 1. Scores quasi-parfaits sur petit dataset = TRÈS SUSPECT
+                    if f1 >= 0.95 and acc_test >= 0.95 and dataset_too_small:
+                        print(f"  ⚠️  OVERFITTING TRÈS PROBABLE!")
+                        print(f"     Scores quasi-parfaits (F1={f1:.3f}, Acc={acc_test:.3f}) sur petit dataset")
+                        overfitting_detected = True
+                        
+                        # Pénalité sévère si les deux sont parfaits
+                        if f1 == 1.0 and cv_f1_mean >= 0.95:
+                            final_score = 0.5  # Pénalité maximum
+                            print(f"     → Pénalité sévère (scores parfaits): {final_score:.3f}")
+                        else:
+                            final_score = cv_f1_mean * 0.7  # Pénalité modérée
+                            print(f"     → Pénalité modérée: {final_score:.3f}")
+                    
+                    # 2. Grand écart Test vs CV (indépendamment des scores)
+                    elif abs(f1 - cv_f1_mean) > 0.25:  # Seuil abaissé à 25%
+                        print(f"  ⚠️  OVERFITTING DÉTECTÉ!")
+                        print(f"     Écart Test F1 ({f1:.3f}) vs CV F1 ({cv_f1_mean:.3f}) = {abs(f1 - cv_f1_mean):.3f}")
+                        overfitting_detected = True
+                        final_score = cv_f1_mean  # Utiliser CV
+                    
+                    # 3. Bon équilibre mais sur petit dataset
+                    elif dataset_too_small:
+                        print(f"  ✓  Équilibre Train/CV/Test acceptable")
+                        # Légère pénalité pour petit dataset
+                        final_score = f1 * 0.9
+                        print(f"     Petit dataset → légère pénalité: {final_score:.3f}")
+                    
+                    # 4. Tout va bien
+                    else:
+                        print(f"  ✅ Bon équilibre - Dataset suffisant")
+                        final_score = f1
+                        
+                except Exception as e:
+                    print(f"    ⚠️ Erreur Cross-Validation: {e}")
+                    # Si CV échoue mais score parfait
+                    if f1 >= 0.95 and acc_test >= 0.95 and dataset_too_small:
+                        print(f"  ⚠️  Score quasi-parfait + CV échec → Pénalité sévère")
+                        final_score = f1 * 0.5
+                        overfitting_detected = True
+                    else:
+                        final_score = f1
+            else:
+                print(f"  ⚠️  Dataset trop petit pour CV fiable ({len(X_train)} échantillons)")
+                # Pénalité automatique basée sur la taille et les scores
+                if f1 >= 0.95:
+                    final_score = f1 * 0.5  # Pénalité sévère
+                    print(f"     Score quasi-parfait + mini-dataset → Pénalité sévère: {final_score:.3f}")
+                    overfitting_detected = True
+                elif len(X_train) < 30:
+                    final_score = f1 * 0.6  # Pénalité forte
+                    print(f"     Pénalité forte appliquée: {final_score:.3f}")
+                    overfitting_detected = True
+                else:
+                    final_score = f1 * 0.8  # Pénalité modérée
+                    print(f"     Pénalité modérée appliquée: {final_score:.3f}")
+            
+            # Stocker les résultats
             results[model_name] = {
                 'model': model,
                 'acc_train': acc_train,
@@ -587,18 +685,31 @@ class WeatherMLPipeline:
                 'precision': precision,
                 'recall': recall,
                 'f1': f1,
-                'roc_auc': roc_auc
+                'roc_auc': roc_auc,
+                'cv_f1_mean': cv_f1_mean,
+                'cv_f1_std': cv_f1_std,
+                'final_score': final_score,
+                'overfitting_detected': overfitting_detected
             }
             
+            # Affichage des métriques
+            print(f"  ✓ Accuracy Train: {acc_train:.3f}")
             print(f"  ✓ Accuracy Test: {acc_test:.3f}")
             print(f"  ✓ Precision: {precision:.3f}")
             print(f"  ✓ Recall: {recall:.3f}")
-            print(f"  ✓ F1-Score: {f1:.3f}")
+            print(f"  ✓ F1-Score Test: {f1:.3f}")
+            if cv_f1_mean > 0:
+                print(f"  ✓ F1-Score CV: {cv_f1_mean:.3f} (±{cv_f1_std:.3f})")
             if roc_auc > 0:
                 print(f"  ✓ ROC AUC: {roc_auc:.3f}")
+            print(f"  🎯 Score Final (sélection): {final_score:.3f}")
             
-            if f1 > self.best_rain_score:
-                self.best_rain_score = f1
+            if overfitting_detected:
+                print(f"  ⚠️  Modèle suspect d'overfitting")
+            
+            # Sélection basée sur le score final
+            if final_score > self.best_rain_score:
+                self.best_rain_score = final_score
                 self.best_rain_model = model
                 self.best_rain_model_name = model_name
                 self.best_rain_metrics = {
@@ -607,8 +718,13 @@ class WeatherMLPipeline:
                     'precision': precision,
                     'recall': recall,
                     'f1': f1,
-                    'roc_auc': roc_auc
+                    'roc_auc': roc_auc,
+                    'cv_f1_mean': cv_f1_mean,
+                    'cv_f1_std': cv_f1_std,
+                    'final_score': final_score,
+                    'overfitting_detected': overfitting_detected
                 }
+                print(f"  🏆 Nouveau meilleur modèle! (Score: {final_score:.3f})")
         
         return results
     
@@ -624,9 +740,13 @@ class WeatherMLPipeline:
             scaler=self.scaler
         )
         
+        overfitting_warning = ""
+        if self.best_rain_metrics.get('overfitting_detected', False):
+            overfitting_warning = " ⚠️ (overfitting détecté)"
+        
         print(f"\n✅ Pipeline créé:")
         print(f"  • Modèle température: {self.best_temp_model_name} (R²={self.best_temp_score:.3f})")
-        print(f"  • Modèle pluie: {self.best_rain_model_name} (F1={self.best_rain_score:.3f})")
+        print(f"  • Modèle pluie: {self.best_rain_model_name} (Score={self.best_rain_score:.3f}){overfitting_warning}")
         
         return self.unified_pipeline
     
@@ -649,8 +769,9 @@ class WeatherMLPipeline:
         # Log des métriques du modèle pluie
         print("\n📊 Métriques - Modèle Pluie:")
         for metric, value in self.best_rain_metrics.items():
-            mlflow.log_metric(f"rain_{metric}", value)
-            print(f"  • {metric}: {value:.4f}")
+            if isinstance(value, (int, float, bool)):
+                mlflow.log_metric(f"rain_{metric}", float(value))
+                print(f"  • {metric}: {value:.4f}" if isinstance(value, float) else f"  • {metric}: {value}")
         
         # Log des paramètres
         mlflow.log_param("temp_model_name", self.best_temp_model_name)
@@ -659,6 +780,7 @@ class WeatherMLPipeline:
         mlflow.log_param("n_features_rain", len(feature_names_rain))
         mlflow.log_param("pipeline_type", "unified")
         mlflow.log_param("rain_model_available", True)
+        mlflow.log_param("overfitting_detected", self.best_rain_metrics.get('overfitting_detected', False))
         
         # Log des tags
         mlflow.set_tags({
@@ -666,7 +788,8 @@ class WeatherMLPipeline:
             "rain_model": self.best_rain_model_name,
             "model_type": "unified",
             "best_temp_r2": str(self.best_temp_score),
-            "best_rain_f1": str(self.best_rain_score)
+            "best_rain_score": str(self.best_rain_score),
+            "overfitting_warning": str(self.best_rain_metrics.get('overfitting_detected', False))
         })
         
         print("\n📦 Sauvegarde des modèles...")
@@ -677,7 +800,7 @@ class WeatherMLPipeline:
         temp_dir = tempfile.mkdtemp()
         
         try:
-            # Sauvegarder le pipeline unifié avec pickle (plus simple)
+            # Sauvegarder le pipeline unifié avec pickle
             print("  🔄 Pipeline unifié...")
             pipeline_path = os.path.join(temp_dir, "unified_pipeline.pkl")
             with open(pipeline_path, 'wb') as f:
@@ -734,42 +857,68 @@ class WeatherMLPipeline:
             # Sauvegarder un fichier README
             print("  🔄 Documentation...")
             readme_path = os.path.join(temp_dir, "README.md")
-            with open(readme_path, 'w') as f:
+            
+            overfitting_note = ""
+            if self.best_rain_metrics.get('overfitting_detected', False):
+                overfitting_note = f"""
+## ⚠️ AVERTISSEMENT OVERFITTING
+Le modèle de pluie ({self.best_rain_model_name}) a été détecté comme potentiellement overfitté.
+- F1 Test: {self.best_rain_metrics['f1']:.4f}
+- F1 CV: {self.best_rain_metrics.get('cv_f1_mean', 0):.4f}
+- Score Final (pénalisé): {self.best_rain_score:.4f}
+
+**Recommandations:**
+- Collecter plus de données (minimum 100 cas de pluie)
+- Réévaluer le modèle sur de nouvelles données
+- Considérer une approche plus simple ou régression continue
+"""
+            
+            with open(readme_path, 'w', encoding='utf-8') as f:
                 f.write(f"""# Weather Forecasting Model
 
-    ## Modèles
-    - **Température**: {self.best_temp_model_name} (R² = {self.best_temp_score:.4f})
-    - **Pluie**: {self.best_rain_model_name} (F1 = {self.best_rain_score:.4f})
+## Modèles
+- **Température**: {self.best_temp_model_name} (R² = {self.best_temp_score:.4f})
+- **Pluie**: {self.best_rain_model_name} (Score Final = {self.best_rain_score:.4f})
 
-    ## Fichiers
-    - `unified_pipeline.pkl`: Pipeline complet (température + pluie)
-    - `temperature_model.pkl`: Modèle température seul
-    - `rain_model.pkl`: Modèle pluie seul
-    - `scaler.pkl`: StandardScaler pour normalisation
-    - `encoders.pkl`: LabelEncoders pour city et condition
-    - `feature_names.json`: Noms des features
+{overfitting_note}
 
-    ## Utilisation
-    ```python
-    import pickle
-    import numpy as np
+## Métriques Pluie
+- Accuracy Test: {self.best_rain_metrics.get('acc_test', 0):.4f}
+- Precision: {self.best_rain_metrics.get('precision', 0):.4f}
+- Recall: {self.best_rain_metrics.get('recall', 0):.4f}
+- F1-Score Test: {self.best_rain_metrics.get('f1', 0):.4f}
+- F1-Score CV: {self.best_rain_metrics.get('cv_f1_mean', 0):.4f} (±{self.best_rain_metrics.get('cv_f1_std', 0):.4f})
+- ROC AUC: {self.best_rain_metrics.get('roc_auc', 0):.4f}
 
-    # Charger le pipeline
-    with open('unified_pipeline.pkl', 'rb') as f:
-        pipeline = pickle.load(f)
+## Fichiers
+- `unified_pipeline.pkl`: Pipeline complet (température + pluie)
+- `temperature_model.pkl`: Modèle température seul
+- `rain_model.pkl`: Modèle pluie seul
+- `scaler.pkl`: StandardScaler pour normalisation
+- `encoders.pkl`: LabelEncoders pour city et condition
+- `feature_names.json`: Noms des features
 
-    # Prédiction
-    X = np.array([[...]])  # {len(feature_names_temp)} features
-    predictions = pipeline.predict_proba(X)
+## Utilisation
+```python
+import pickle
+import numpy as np
 
-    print(predictions['temperature'])
-    print(predictions['will_rain'])
-    print(predictions['rain_probability'])
-    ```
+# Charger le pipeline
+with open('unified_pipeline.pkl', 'rb') as f:
+    pipeline = pickle.load(f)
 
-    ## Features ({len(feature_names_temp)})
-    {', '.join(feature_names_temp[:10])}...
-    """)
+# Prédiction
+X = np.array([[...]])  # {len(feature_names_temp)} features
+predictions = pipeline.predict_proba(X)
+
+print(predictions['temperature'])
+print(predictions['will_rain'])
+print(predictions['rain_probability'])
+```
+
+## Features ({len(feature_names_temp)})
+{', '.join(feature_names_temp[:10])}...
+""")
             mlflow.log_artifact(readme_path, artifact_path="models")
             print("  ✓ Documentation enregistrée")
             
@@ -780,6 +929,10 @@ class WeatherMLPipeline:
         print(f"\n✅ Pipeline unifié enregistré avec succès dans Azure ML!")
         print(f"   Run ID: {mlflow.active_run().info.run_id}")
         print(f"   Tous les modèles sont dans: Artifacts → models/")
+        
+        if self.best_rain_metrics.get('overfitting_detected', False):
+            print(f"\n⚠️  ATTENTION: Overfitting détecté sur le modèle de pluie")
+            print(f"   Consultez le README.md pour plus de détails")
     
     def log_temperature_only_azure(self, run, feature_names_temp):
         """Enregistrer uniquement le modèle de température dans Azure ML"""
@@ -862,15 +1015,18 @@ class WeatherMLPipeline:
         print(temp_df.to_string(index=False))
         
         if rain_results:
-            print("\n🌧️  PLUIE (Classification):")
+            print("\n🌧️  PLUIE (Classification avec détection overfitting):")
             rain_df = pd.DataFrame({
                 'Model': list(rain_results.keys()),
                 'Accuracy': [r['acc_test'] for r in rain_results.values()],
                 'Precision': [r['precision'] for r in rain_results.values()],
                 'Recall': [r['recall'] for r in rain_results.values()],
-                'F1-Score': [r['f1'] for r in rain_results.values()]
+                'F1-Test': [r['f1'] for r in rain_results.values()],
+                'F1-CV': [r['cv_f1_mean'] if r['cv_f1_mean'] > 0 else float('nan') for r in rain_results.values()],
+                'Score Final': [r['final_score'] for r in rain_results.values()],
+                'Overfit?': ['⚠️' if r['overfitting_detected'] else '✓' for r in rain_results.values()]
             })
-            rain_df = rain_df.sort_values('F1-Score', ascending=False)
+            rain_df = rain_df.sort_values('Score Final', ascending=False)
             rain_df['Best'] = rain_df['Model'].apply(
                 lambda x: '🏆' if x == self.best_rain_model_name else ''
             )
@@ -881,7 +1037,8 @@ class WeatherMLPipeline:
         print(f"\n🏆 MEILLEURS MODÈLES SÉLECTIONNÉS:")
         print(f"  • Température: {self.best_temp_model_name} (R²={self.best_temp_score:.3f})")
         if self.best_rain_model_name:
-            print(f"  • Pluie: {self.best_rain_model_name} (F1={self.best_rain_score:.3f})")
+            overfitting_note = " ⚠️ (overfitting détecté)" if self.best_rain_metrics.get('overfitting_detected', False) else ""
+            print(f"  • Pluie: {self.best_rain_model_name} (Score={self.best_rain_score:.3f}){overfitting_note}")
         
         return temp_df, rain_df
 
@@ -905,11 +1062,13 @@ def main():
         )
     
     print("="*80)
-    print("🌤️  WEATHER FORECASTING - PIPELINE UNIFIÉ COMPLET")
+    print("🌤️  WEATHER FORECASTING - PIPELINE UNIFIÉ AVEC DÉTECTION OVERFITTING")
     print("="*80)
     print("📋 Prédictions:")
     print("  1️⃣ Température (Régression)")
     print("  2️⃣ Pluie (Classification avec température prédite)")
+    print("  🔍 Détection automatique d'overfitting via Cross-Validation")
+    print("  ⚠️  Pénalités sévères pour scores parfaits sur petits datasets")
     print("="*80)
     
     # Connexion à Azure ML
@@ -1100,7 +1259,7 @@ def main():
                 X_rain_train, y_rain_train, strategy=strategy
             )
         
-        # Entraîner les modèles de pluie
+        # Entraîner les modèles de pluie (avec détection overfitting AMÉLIORÉE)
         rain_results = pipeline.train_rain_models(
             X_rain_train, X_rain_test, y_rain_train, y_rain_test
         )
@@ -1158,7 +1317,8 @@ def main():
             print(f"  • Modèles pluie testés: {len(rain_results)}")
         print(f"  • Meilleur température: {pipeline.best_temp_model_name} (R²={pipeline.best_temp_score:.3f})")
         if pipeline.best_rain_model_name:
-            print(f"  • Meilleur pluie: {pipeline.best_rain_model_name} (F1={pipeline.best_rain_score:.3f})")
+            overfitting_note = " ⚠️ (overfitting)" if pipeline.best_rain_metrics.get('overfitting_detected', False) else ""
+            print(f"  • Meilleur pluie: {pipeline.best_rain_model_name} (Score={pipeline.best_rain_score:.3f}){overfitting_note}")
         
         if azure_ml_client:
             print(f"\n☁️  Modèles enregistrés dans Azure ML:")
@@ -1174,6 +1334,11 @@ def main():
         else:
             print(f"\n⚠️ Modèles sauvegardés localement uniquement")
             print(f"  Configure Azure ML pour enregistrer dans le cloud")
+        
+        if pipeline.best_rain_metrics.get('overfitting_detected', False):
+            print(f"\n⚠️  AVERTISSEMENT:")
+            print(f"  Le modèle de pluie présente des signes d'overfitting")
+            print(f"  Recommandation: Collecter plus de données avant déploiement production")
         
         print("\n" + "="*80)
 
